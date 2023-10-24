@@ -10,6 +10,7 @@
     "axios": "^0.21.4",
     "binance": "^2.4.1",
     "body-parser": "^1.20.1",
+    "bybit-api": "^3.7.3",
     "bytes": "^3.1.2",
     "call-bind": "^1.0.2",
     "chalk": "^5.1.2",
