@@ -1,5 +1,6 @@
-import pkg, { ContractClient } from 'bybit-api-gnome';
-const { WebsocketClient, WS_KEY_MAP, LinearClient, AccountAssetClient, SpotClientV3} = pkg;
+import { WebsocketClient, WS_KEY_MAP, AccountAssetClient, SpotClientV3 } from 'bybit-api';
+import { LinearClient } from './linear_client.js';
+//const { WebsocketClient, WS_KEY_MAP, AccountAssetClient, SpotClientV3} = pkg;
 import { WebsocketClient as binanceWS } from 'binance';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
@@ -22,8 +23,8 @@ import { newPosition, incrementPosition, closePosition, updatePosition } from '.
 import { loadJson, storeJson, traceTrade, dumpLiquidationInfo } from './utils.js';
 import { createMarketOrder, createLimitOrder, cancelOrder } from './order.js';
 import { logIT, LOG_LEVEL } from './log.js';
-import { CachedLinearClient } from './exchange.js'
 import { checkListingDate, getVolatility } from './filters.js'
+import { threadId } from 'worker_threads';
 
 dotenv.config();
 
@@ -48,11 +49,11 @@ if (process.env.CHECK_FOR_UPDATE === 'true')
 const timestampBotStart = moment();
 
 var hook;
-var reporthook;		   
+var reporthook;
 if (process.env.USE_DISCORD == "true") {
     hook = new Webhook(process.env.DISCORD_URL);
 	if (process.env.SPLIT_DISCORD_LOG_AND_REPORT == "true") {
-		reporthook = new Webhook(process.env.DISCORD_URL_REPORT);	
+		reporthook = new Webhook(process.env.DISCORD_URL_REPORT);
 	}
 }
 
@@ -122,7 +123,7 @@ app.use(session({
 app.get('/login', (req, res) => {
     res.sendFile('login.html', { root: 'gui' });
 });
-  
+
 app.post('/login', (req, res) => {
     const password = req.body.password;
     if (password === process.env.GUI_PASSWORD) {
@@ -132,7 +133,7 @@ app.post('/login', (req, res) => {
       res.status(401).send('Wrong password');
     }
 });
-  
+
 app.get('/', isAuthenticated, (req, res) => {
     res.sendFile('index.html', { root: 'gui' });
 });
@@ -164,7 +165,7 @@ io.on('connection', (socket) => {
     socket.on('sendsettings', (msg) => {
         getSettings()
     });
-    
+
 });
 
 server.listen(PORT, () => {
@@ -184,7 +185,7 @@ server.listen(PORT, () => {
 const wsClient = new WebsocketClient({
     key: key_webSocket,
     secret: secret_webSocket,
-    market: 'linear',
+    market: 'v5',
     livenet: true,
 });
 
@@ -193,12 +194,13 @@ if (process.env.USE_TESTNET == "true") {
     wsTestClient = new WebsocketClient({
     key: key,
     secret: secret,
-    market: 'linear',
+    market: 'v5',
     livenet: true,
     testnet: true,
     });
 }
 
+// TODO: Check testnet
 const binanceClient = new binanceWS({
     beautify: true,
 });
@@ -206,18 +208,16 @@ const binanceClient = new binanceWS({
 const linearClient = new LinearClient({
     key: key,
     secret: secret,
-    livenet: true,
     testnet: process.env.USE_TESTNET == "true",
+    rateLimitExceedCallback: ()=> {
+      logIT(chalk.redBright(`RATE LIMIT EXCEED`), LOG_LEVEL.ERROR);
+      process.exit(4);
+    },
 });
-const cachedLinearClient = new CachedLinearClient(linearClient);
 
 //create linear client
-const contractClient = new ContractClient({
-  key: key,
-  secret: secret,
-  livenet: true,
-  testnet: process.env.USE_TESTNET == "true",
-});
+const contractClient = linearClient;
+
 //account client
 if (process.env.WITHDRAW == "true" || process.env.TRANSFER_TO_SPOT == "true"){
     const accountClient = new AccountAssetClient({
@@ -325,7 +325,7 @@ function wsHandleOrder(data) {
         //only needed with DCA_AVERAGE_ENTRIES features on.
         if (process.env.DCA_TYPE == "DCA_AVERAGE_ENTRIES") {
           let res = await cancelOrder(linearClient, order.symbol);
-          if (res.ret_msg != "OK")
+          if (res.retMsg != "OK")
             logIT(`on-update - error cancelling orphan orders for ${order.symbol}`, LOG_LEVEL.ERROR);
           else
             logIT(`on-update - successfully cancel orphan orders for ${order.symbol}`);
@@ -343,7 +343,7 @@ function wsHandleLiquidations(data) {
     var price = parseFloat(data.data.price);
     var side = data.data.side;
     //convert to float
-    var qty = parseFloat(data.data.qty) * price;
+    var qty = parseFloat(data.data.size) * price;
     //create timestamp
     var timestamp = Math.floor(Date.now() / 1000);
     //find what index of liquidationOrders array is the pair
@@ -515,7 +515,7 @@ binanceClient.on('formattedMessage', (data) => {
         }
 
         if (liquidationOrders[index].qty > process.env.MIN_LIQUIDATION_VOLUME) {
-                
+
             if (stopLossCoins.has(pair) == true && process.env.USE_STOP_LOSS_TIMEOUT == "true") {
                 logIT(chalk.yellow(liquidationOrders[index].pair + " is not allowed to trade cause it is on timeout"));
             } else {
@@ -575,24 +575,29 @@ binanceClient.on('error', (data) => {
     logIT('ws saw error ', data?.wsKey);
 });
 
+// TODO: OCHO
+function remapFloatField(resp) {
+  return Object.fromEntries( Object.entries(resp).map(([key, value]) => [key, parseFloat(value) ? parseFloat(value) : value]) );
+}
+
 const wsClientPtr = process.env.USE_TESTNET == "true" ? wsTestClient : wsClient;
 //subscribe to stop_order to see when we hit stop-loss
-wsClientPtr.subscribe('stop_order');
+wsClientPtr.subscribeV5('user.stop_order.contractAccount', 'linear').catch(e => logIT(e, LOG_LEVEL.ERROR));
 
 //subscribe to order to see when orders where executed
-wsClientPtr.subscribe('order');
+wsClientPtr.subscribeV5('user.order.contractAccount', 'linear').catch(e => logIT(e, LOG_LEVEL.ERROR));
 
 //run websocket
 async function liquidationEngine(pairs) {
     if (process.env.LIQ_SOURCE.toLowerCase() == 'both') {
-        wsClient.subscribe(pairs);
+        wsClient.subscribeV5(pairs, 'linear').catch(e => logIT(e, LOG_LEVEL.ERROR));
         binanceClient.subscribeAllLiquidationOrders('usdm');
     }
     else if (process.env.LIQ_SOURCE.toLowerCase() == 'binance') {
         binanceClient.subscribeAllLiquidationOrders('usdm');
     }
     else {
-        wsClient.subscribe(pairs);
+        wsClient.subscribeV5(pairs, 'linear').catch(e => logIT(e, LOG_LEVEL.ERROR));
     }
 }
 
@@ -653,7 +658,13 @@ async function getServerTime() {
 
 //Get margin
 async function getMargin() {
-    return (await cachedLinearClient.getWalletBalance()).used_margin;
+    return (await linearClient.getWalletBalance({accountType: process.env.ACCOUNT_TYPE, coin: 'USDT'}, true)).usedMargin;
+}
+
+async function getOpenPositionsCount() {
+  const positions = await linearClient.getPositionInfo({}, true);
+  const openPositions = positions.result.list.filter(el => parseFloat(el.size) > 0).length;
+  return openPositions;
 }
 
 //get account balance
@@ -662,21 +673,21 @@ async function getBalance() {
     try{
         // get ping
         var started = Date.now();
-        const data = await cachedLinearClient.getWalletBalance();
+        const data = await linearClient.getWalletBalance({accountType: process.env.ACCOUNT_TYPE, coin: 'USDT'}, true);
         var elapsed = (Date.now() - started);
         if (!data) {
-            logIT(chalk.redBright("Error fetching balance. err: " + data.ret_code + "; msg: " + data.ret_msg));
+            logIT(chalk.redBright("Error fetching balance. err: " + data.ret_code + "; msg: " + data.retMsg));
             getBalanceTryCount++;
             if (getBalanceTryCount == 3)
               process.exit(1);
             return;
         }
         getBalanceTryCount = 0
-        var availableBalance = data.available_balance;
+        var availableBalance = data.availableBalance;
         // save balance global to reduce api requests
-        global_balance = data.available_balance;
-        var usedBalance = data.used_margin;
-        var balance = data.whole_balance;
+        global_balance = data.availableBalance;
+        var usedBalance = data.usedMargin;
+        var balance = data.wholeBalance;
 
         //load settings.json
         const settings = JSON.parse(fs.readFileSync('account.json', 'utf8'));
@@ -709,22 +720,22 @@ async function getBalance() {
                 secret: secret,
                 livenet: true,
             });
-    
+
             const spotBal = await spotClient.getBalances();
-    
+
             if (spotBal.retCode != 0) {
                 logIT(chalk.redBright("Error fetching spot balance. err: " + spotBal.retCode + "; msg: " + spotBal.retMsg));
                 process.exit(1);
             }
-    
+
             var withdrawCoin = spotBal.result.balances.find(item => item.coin === process.env.WITHDRAW_COIN);
-    
+
             if (withdrawCoin !== undefined && withdrawCoin.total >= process.env.AMOUNT_TO_WITHDRAW && process.env.WITHDRAW == "true"){
                 withdrawFunds();
                 logIT("Withdraw " + withdrawCoin.total + " to " + process.env.WITHDRAW_ADDRESS)
             }
         }
-        
+
         //if positive diff then log green
         if (diff >= 0) {
             logIT(chalk.greenBright.bold("Profit: " + diff.toFixed(4) + " USDT" + " (" + percentGain.toFixed(2) + "%)") + " | " + chalk.magentaBright.bold("Balance: " + balance.toFixed(4) + " USDT"));
@@ -738,26 +749,26 @@ async function getBalance() {
         var percentGain = percentGain.toFixed(6);
         var diff = diff.toFixed(6);
         //fetch positions
-        var positions = await cachedLinearClient.getPosition();
+        var positions = await linearClient.getPositionInfo({settleCoin: 'USDT'}, true);
         var positionList = [];
         var marg = await getMargin();
         var time = await getServerTime();
         //loop through positions.result[i].data get open symbols with size > 0 calculate pnl and to array
-        for (var i = 0; i < positions.result.length; i++) {
-            if (positions.result[i].data.size > 0) {
-                
-                var pnl1 = positions.result[i].data.unrealised_pnl;
+        for (var i = 0; i < positions.result.list.length; i++) {
+            const positionObj = remapFloatField(positions.result.list[i]);
+            if (positionObj.size > 0) {
+
+                var pnl1 = positionObj.unrealisedPnl;
                 var pnl = pnl1.toFixed(6);
-                var symbol = positions.result[i].data.symbol;
-                var size = positions.result[i].data.size;
-                var liq = positions.result[i].data.liq_price;
-                var size = size.toFixed(4);
-                var ios = positions.result[i].data.is_isolated;
+                var symbol = positionObj.symbol;
+                var size = positionObj.size.toFixed(4);
+                var liq = positionObj.liqPrice;
+                var ios = positionObj.isIsolated; //TODO:
 
-                var priceFetch = await cachedLinearClient.getTickers({symbol: symbol});
-                var test = priceFetch.result[0].last_price;
+                var priceFetch = await linearClient.getTickers({symbol: symbol}, true);
+                var test = parseFloat(priceFetch.result.list[0].lastPrice);
 
-                let side = positions.result[i].data.side;
+                let side = positionObj.side;
                 var dir = "";
                 if (side === "Buy") {
                     dir = "✅ Long / ❌ Short";
@@ -765,14 +776,14 @@ async function getBalance() {
                     dir = "❌ Long / ✅ Short";
                 }
 
-                var stop_loss = positions.result[i].data.stop_loss;
-                var take_profit = positions.result[i].data.take_profit;
-                var price = positions.result[i].data.entry_price;
-                var fee = positions.result[i].data.occ_closing_fee;
+                var stop_loss = positionObj.stopLoss;
+                var take_profit = positionObj.takeProfit;
+                var price = positionObj.avgPrice;
+                var fee = 0 //positionObj.occ_closingFee; //TODO: BOOOOO
                 var price = price.toFixed(4);
 
                 //calulate size in USDT
-                var usdValue = (positions.result[i].data.entry_price * size) / process.env.LEVERAGE;
+                var usdValue = (positionObj.avgPrice * size) / process.env.LEVERAGE;
                 var position = {
                     "symbol": symbol,
                     "size": size,
@@ -791,9 +802,9 @@ async function getBalance() {
                 let trade = tradesHistory.get(symbol);
                 // handle existing orders when app starts
                 if (trade === undefined) {
-                  var usdValue = (positions.result[i].data.entry_price * size) / process.env.LEVERAGE;
+                  var usdValue = (positionObj.entryPrice * size) / process.env.LEVERAGE;
                   const dca_count = Math.trunc( usdValue / (balance*process.env.PERCENT_ORDER_SIZE/100) );
-                  tradesHistory.set(symbol, {...position, "_max_loss" : 0, "_dca_count" : dca_count, "_start_price" : positions.result[i].data.entry_price});
+                  tradesHistory.set(symbol, {...position, "_max_loss" : 0, "_dca_count" : dca_count, "_start_price" : positionObj.entryPrice});
                   trade = tradesHistory.get(symbol);
                 } else {
                   updatePosition(trade, {"_max_loss": Math.min(pnl, trade._max_loss), "price": price, "stop_loss": stop_loss, "take_profit": take_profit});
@@ -806,8 +817,8 @@ async function getBalance() {
         }
 
         //create data payload
-        const positionsCount = await cachedLinearClient.getOpenPositions();
-        const posidata = { 
+        const positionsCount = await getOpenPositionsCount()
+        const posidata = {
             balance: balance.toFixed(2).toString(),
             leverage: process.env.LEVERAGE.toString(),
             totalUSDT: marg.toFixed(2).toString(),
@@ -862,42 +873,36 @@ async function getBalance() {
 //get position
 async function getPosition(pair, side) {
     //gor through all pairs and getPosition()
-    var positions = await cachedLinearClient.getPosition(pair);
     const error_result = {side: null, entryPrice: null, size: null, percentGain: null};
-    if (positions.result == null)
-      logIT("Open positions response is null");
-    else if (!Array.isArray(positions.result))
-      logIT(`Open positions bad results: array type was expected: positions.result = ${positions.result}`);
-    else {
-        //look for pair in positions with the same side
-        var index = positions.result.findIndex(x => x.data.symbol === pair && x.data.side === side);
-        //make sure index is not -1
-        if (index == -1)
-          logIT(`Open positions bad response: symbol ${pair} not found`);
-        else {
-            if (positions.result[index].data.size >= 0) {
-                //console.log(positions.result[index].data);
-                if(positions.result[index].data.size > 0){
-                    logIT(chalk.blueBright("Open position found for " + positions.result[index].data.symbol + " with a size of " + positions.result[index].data.size + " contracts" + " with profit of " + positions.result[index].data.realised_pnl + " USDT"));
-                    var profit = positions.result[index ].data.unrealised_pnl;
-                    //calculate the profit % change in USD
-                    var margin = positions.result[index ].data.position_value/process.env.LEVERAGE;
-                    var percentGain = (profit / margin) * 100;
-                    return {side: positions.result[index].data.side, entryPrice: positions.result[index].data.entry_price, size: positions.result[index].data.size, percentGain: percentGain};
-                }
-                else{
-                    //no open position
-                    return {side: positions.result[index].data.side, entryPrice: positions.result[index].data.entry_price, size: positions.result[index].data.size, percentGain: 0};
-                }
-            }
-            else {
-                // adding this for debugging purposes
-                logIT("Error: getPostion invalid for " + pair + " size parameter is returning " + positions.result[index].data.size);
-                messageWebhook("Error: getPostion invalid for " + pair + " size parameter is returning " + positions.result[index].data.size);
-                return {side: null, entryPrice: null, size: null, percentGain: null};
-            }
-        }
+    var positions = await linearClient.getPositionInfo({symbol: pair, settleCoin: 'USDT'}, true);
+    // TODO: check response
+    if (positions.retCode != 0) {
+      logIT("Open positions bad response ${positions.retMsg}");
+      return error_result;
     }
+
+    //look for pair in positions with the same side
+    var index = positions.result.list.findIndex(x => x.data.symbol === pair && x.data.side === side);
+    if (index != -1) {
+        //console.log(positions.result.list[index].data);
+        logIT(chalk.blueBright("Open position found for " + positions.result.list[index].data.symbol + " with a size of " + positions.result.list[index].data.size + " contracts" + " with profit of " + positions.result.list[index].data.realised_pnl + " USDT"));
+        var profit = positions.result.list[index ].data.unrealised_pnl;
+        //calculate the profit % change in USD
+        var margin = positions.result.list[index ].data.position_value/process.env.LEVERAGE;
+        var percentGain = (profit / margin) * 100;
+        return {side: positions.result.list[index].data.side, entryPrice: positions.result.list[index].data.entry_price, size: positions.result.list[index].data.size, percentGain: percentGain};
+    } else {
+      //TODO: insensato
+        //no open position
+        return undefined;
+        //return {side: positions.result.list[index].data.side, entryPrice: positions.result.list[index].data.entry_price, size: positions.result.list[index].data.size, percentGain: 0};
+    }
+        // else {
+        //     // adding this for debugging purposes
+        //     logIT("Error: getPostion invalid for " + pair + " size parameter is returning " + positions.result.list[index].data.size);
+        //     messageWebhook("Error: getPostion invalid for " + pair + " size parameter is returning " + positions.result.list[index].data.size);
+        //     return {side: null, entryPrice: null, size: null, percentGain: null};
+        // }
 
     // return on error
     return {side: null, entryPrice: null, size: null, percentGain: null};
@@ -907,16 +912,18 @@ async function takeProfit(symbol, position) {
 
     //get entry price
     var positions = await position;
+    const entryPrice = parseFloat(positions.avgPrice);
+    const positionSize = parseFloat(positions.size);
 
     if (positions.side === "Buy") {
         var side = "Buy";
-        var takeProfit = positions.entry_price + (positions.entry_price * (process.env.TAKE_PROFIT_PERCENT/100) / process.env.LEVERAGE);
-        var stopLoss = positions.entry_price - (positions.entry_price * (process.env.STOP_LOSS_PERCENT/100) / process.env.LEVERAGE);
+        var takeProfit = (entryPrice + (entryPrice * (process.env.TAKE_PROFIT_PERCENT/100) / process.env.LEVERAGE)).toFixed(decimalPlaces);
+        var stopLoss = (entryPrice - (entryPrice * (process.env.STOP_LOSS_PERCENT/100) / process.env.LEVERAGE)).toFixed(decimalPlaces);
     }
     else {
         var side = "Sell";
-        var takeProfit = positions.entry_price - (positions.entry_price * (process.env.TAKE_PROFIT_PERCENT/100) / process.env.LEVERAGE);
-        var stopLoss = positions.entry_price + (positions.entry_price * (process.env.STOP_LOSS_PERCENT/100) / process.env.LEVERAGE);
+        var takeProfit = (entryPrice - (entryPrice * (process.env.TAKE_PROFIT_PERCENT/100) / process.env.LEVERAGE)).toFixed(decimalPlaces);
+        var stopLoss = (entryPrice + (entryPrice * (process.env.STOP_LOSS_PERCENT/100) / process.env.LEVERAGE)).toFixed(decimalPlaces);
     }
 
     //load min order size json
@@ -927,46 +934,48 @@ async function takeProfit(symbol, position) {
         var index = tickData.findIndex(x => x.pair === symbol);
         var tickSize = tickData[index].tickSize;
         var decimalPlaces = (tickSize.toString().split(".")[1] || []).length;
+        const currentTakeProfit = parseFloat(positions.takeProfit).toFixed(decimalPlaces)
+        const currentStopLoss = parseFloat(positions.stopLoss).toFixed(decimalPlaces)
 
-        if (positions.size > 0 && positions.take_profit.toFixed(decimalPlaces) === 0 || takeProfit.toFixed(decimalPlaces) !== positions.take_profit.toFixed(decimalPlaces) || stopLoss.toFixed(decimalPlaces) !== positions.stop_loss.toFixed(decimalPlaces)) {
+        if (positionSize > 0 && currentTakeProfit === 0 || currentTakeProfit !== takeProfit || stopLoss !== currentStopLoss) {
             if(process.env.USE_STOPLOSS.toLowerCase() === "true") {
 
                 var cfg = {
                     symbol: symbol,
                     side: side,
-                    stop_loss: stopLoss.toFixed(decimalPlaces),
+                    stopLoss: stopLoss,
                 };
 
                 if(process.env.USE_TAKE_PROFIT.toLowerCase() === "true")
-                    cfg['take_profit'] = takeProfit.toFixed(decimalPlaces)
+                    cfg['takeProfit'] = takeProfit;
 
                 const order = await linearClient.setTradingStop(cfg);
                 //console.log(JSON.stringify(order, null, 4));
 
-                if (order.ret_msg === "OK" || order.ret_msg === "not modified" || order.ret_code === 10002) {
+                if (order.retMsg === "OK" || order.retMsg === "not modified" || order.ret_code === 10002) {
                     //console.log(chalk.red("TAKE PROFIT ERROR: ", JSON.stringify(order, null, 2)));
                 }
                 else if (order.ret_code === 130027 || order.ret_code === 130030 || order.ret_code === 130024) {
                     //find current price
                     var priceFetch = await linearClient.getTickers({symbol: symbol});
-                    var price = priceFetch.result[0].last_price;
+                    var price = parseFloat(priceFetch.result.list[0].lastPrice);
                     //if side is sell add 1 tick to price
                     if (side === "Sell") {
-                        price = parseFloat(priceFetch.result[0].ask_price);
+                        price = parseFloat(priceFetch.result.list[0].askPrice);
                     }
                     else {
-                        price = parseFloat(priceFetch.result[0].bid_price);
+                        price = parseFloat(priceFetch.result.list[0].bid_price);
                     }
 
                     var cfg = {
                         symbol: symbol,
                         side: side,
-                        stop_loss: stopLoss.toFixed(decimalPlaces),
+                        stopLoss: stopLoss,
                     };
-    
+
                     if(process.env.USE_TAKE_PROFIT.toLowerCase() === "true")
-                        cfg['take_profit'] = price.toFixed(decimalPlaces)
-    
+                        cfg['takeProfit'] = price.toFixed(decimalPlaces)
+
                     const order = await linearClient.setTradingStop(cfg);
 
                     logIT(chalk.red("TAKE PROFIT FAILED FOR " + symbol + " WITH ERROR PRICE MOVING TOO FAST OR ORDER ALREADY CLOSED, TRYING TO FILL AT BID/ASK!!"));
@@ -978,32 +987,38 @@ async function takeProfit(symbol, position) {
             }
             else if (process.env.USE_TAKE_PROFIT.toLowerCase() === "true"){
                 const order = await linearClient.setTradingStop({
+                    // if hedge mode
+                    positionIdx: side == 'Buy' ? 1 : 2,
                     symbol: symbol,
                     side: side,
-                    take_profit: takeProfit.toFixed(decimalPlaces),
+                    takeProfit: takeProfit,
                 });
                 //console.log(JSON.stringify(order, null, 2));
-                if(order.ret_msg === "OK" || order.ret_msg === "not modified" || order.ret_code ===  130024) {
+                if(order.retMsg === "OK" || order.retMsg === "not modified" || order.retCode ===  34040) {
                     //console.log(chalk.red("TAKE PROFIT ERROR: ", JSON.stringify(order, null, 2)));
                 }
                 else if (order.ret_code === 130027 || order.ret_code === 130030) {
                     logIT(chalk.cyanBright("TAKE PROFIT FAILED PRICING MOVING FAST!! TRYING TO PLACE ABOVE CURRENT PRICE!!"));
                     //find current price
                     var priceFetch = await linearClient.getTickers({symbol: symbol});
+
                     logIT("Current price: " + JSON.stringify(priceFetch, null, 4));
-                    var price = priceFetch.result[0].last_price;
+                    var price = parseFloat(priceFetch.result.list[0].lastPrice);
+
                     //if side is sell add 1 tick to price
                     if (side === "Sell") {
-                        price = priceFetch.result[0].ask_price
+                        price = parseFloat(priceFetch.result.list[0].askPrice);
                     }
                     else {
-                        price = priceFetch.result[0].bid_price
+                        price = parseFloat(priceFetch.result.list[0].bidPrice);
                     }
                     logIT("Price for symbol " + symbol + " is " + price);
                     const order = await linearClient.setTradingStop({
+                        // if hedge mode
+                        positionIdx: side == 'Buy' ? 1 : 2,
                         symbol: symbol,
                         side: side,
-                        take_profit: price,
+                        takeProfit: price,
                     });
                     logIT(chalk.red("TAKE PROFIT FAILED FOR " + symbol + " WITH ERROR PRICE MOVING TOO FAST, TRYING TO FILL AT BID/ASK!!"));
                 }
@@ -1014,8 +1029,8 @@ async function takeProfit(symbol, position) {
         }
         else {
             logIT("No take profit to set for " + symbol);
-            console.log("takeProfit " + takeProfit.toFixed(decimalPlaces))
-            console.log("positions.take_profit " + positions.take_profit.toFixed(decimalPlaces))
+            console.log("takeProfit " + takeProfit);
+            console.log("positions.takeProfit " + currentTakeProfit);
         }
     }
     catch (e) {
@@ -1073,17 +1088,18 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
 
     var position = await getPosition(pair, side);
 
-    if (position ? position.size == null : true) {
-      logIT(chalk.redBright("scalp - " + "Error getting position for " + pair));
-      return;
-    }
+    // if (position ? position.size == null : true) {
+    //   logIT(chalk.redBright("scalp - " + "Error getting position for " + pair));
+    //   return;
+    // }
+    const positionSize = position == undefined ? 0 : parseFloat(position.size);
 
-    if (position.size === 0 && new_trades_disabled) {
+    if (positionSize == 0 && new_trades_disabled) {
       logIT("scalp - " + "Server is in pause new trades are disabled");
       return;
     }
 
-    if (position.size === 0 && tradesHistory.get(pair) != undefined) {
+    if (positionSize == 0 && tradesHistory.get(pair) != undefined) {
       logIT("scalp - discard order as exchange position data is not updated: position was already opened and does not result on exchange yet");
       return;
     }
@@ -1096,7 +1112,7 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
     }
 
     // place new order
-    if (position.size === 0) {
+    if (positionSize == 0) {
 
       if (open_positions >= process.env.MAX_OPEN_POSITIONS) {
         logIT(chalk.redBright("scalp - Max Open Positions Reached!"));
@@ -1108,6 +1124,7 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
         const volatility = await getVolatility(pair, parseInt(env.FILTER_CHECK_VOLATILITY_PERIOD));
         if (volatility >  parseFloat(env.FILTER_CHECK_VOLATILITY_PRC)) { // if volatility > env.FILTER_CHECK_VOLATILITY_PRC discard token
           logIT("scalp - discard order as token ${pair} have too big volatility ${volatility}");
+          return;
         }
       }
 
@@ -1121,7 +1138,7 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
 
       //get current price
       var priceFetch = await linearClient.getTickers({symbol: pair});
-      var price = priceFetch.result[0].last_price;
+      const price = parseFloat(priceFetch.result.list[0].lastPrice);
 
       // set leverage and margin-mode
       setLeverage(pair, process.env.LEVERAGE)
@@ -1132,8 +1149,8 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
         (side == "Buy" ? minuspercent(price, process.env.STOP_LOSS_PERCENT).toFixed(decimalPlaces) : pluspercent(price, process.env.STOP_LOSS_PERCENT).toFixed(decimalPlaces)) : 0;
       let size = settings.pairs[settingsIndex].order_size.toFixed(decimalPlaces);
       let order = await createMarketOrder(linearClient, pair, side, size, take_profit, stop_loss);
-      if (order.ret_msg != "OK") {
-        logIT(`scalp exit: Error placing new ${side} order: ${order.ret_msg}`);
+      if (order.retMsg != "OK") {
+        logIT(`scalp exit: Error placing new ${side} order: ${order.retMsg}`);
         return;
       } else {
         handleNewOrder(order.result, trigger_qty);
@@ -1147,8 +1164,8 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
             dca_price = dca_price.toFixed(decimalPlaces)
             dca_size = (dca_size * process.env.DCA_VOLUME_SCALE).toFixed(decimalPlaces)
             const dcaOrder = await createLimitOrder(linearClient, pair, side, dca_size, dca_price);
-            if (dcaOrder.ret_msg != "OK") {
-              logIT(`scalp exit: Error placing new ${side} DCA[${i}] order: ${dcaOrder.ret_msg} for ${pair} at price ${dca_price}`, LOG_LEVEL.ERROR);
+            if (dcaOrder.retMsg != "OK") {
+              logIT(`scalp exit: Error placing new ${side} DCA[${i}] order: ${dcaOrder.retMsg} for ${pair} at price ${dca_price}`, LOG_LEVEL.ERROR);
               return;
             }
             logIT(chalk.bgGreenBright(`scalp - ${side} DCA[${i}] Order Placed for ${pair} at ${dca_size} size`));
@@ -1156,14 +1173,16 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
         }
 
         if(process.env.USE_DISCORD == "true") {
-          orderWebhook(pair, settings.pairs[settingsIndex].order_size, side, position.size, position.percentGain, trigger_qty, source);
+          orderWebhook(pair, settings.pairs[settingsIndex].order_size, side, positionSize, 0, trigger_qty, source);
         }
-      }
-    } else if (position.percentGain < 0 && process.env.USE_DCA_FEATURE == "true" && process.env.DCA_TYPE == "DCA_LIQUIDATIONS") {
+      } //TODO: remap position fields
+    } else {
+      const positionPercentGain = (parseFloat(position.markPrice) - parseFloat(position.avgPrice)) / parseFloat(position.avgPrice) * (position.side == "Buy" ? 1 : -1);
+      if (positionPercentGain < 0 && process.env.USE_DCA_FEATURE == "true" && process.env.DCA_TYPE == "DCA_LIQUIDATIONS") {
 
         //Long/Short liquidation
         //make sure order is less than max order size
-        if ((position.size + settings.pairs[settingsIndex].order_size) > settings.pairs[settingsIndex].max_position_size) {
+        if ((positionSize + settings.pairs[settingsIndex].order_size) > settings.pairs[settingsIndex].max_position_size) {
           //max position size reached
           logIT("scalp - " + "Max position size reached for " + pair);
           messageWebhook("Max position size reached for " + pair);
@@ -1177,10 +1196,11 @@ async function scalp(pair, liquidationInfo, source, new_trades_disabled = false)
         handleDcaOrder(order.result, trigger_qty);
         logIT(chalk.bgGreenBright.black("scalp - " + side + " DCA Order Placed for " + pair + " at " + settings.pairs[settingsIndex].order_size + " size"));
         if(process.env.USE_DISCORD == "true") {
-            orderWebhook(pair, settings.pairs[settingsIndex].order_size, side, position.size, position.percentGain, trigger_qty, source);
+            orderWebhook(pair, settings.pairs[settingsIndex].order_size, side, positionSize, positionPercentGain, trigger_qty, source);
         }
-    } else {
-      logIT(chalk.redBright("scalp - " + "DCA disabled or position pnl is positive for " + pair));
+      } else {
+        logIT(chalk.redBright("scalp - " + "DCA disabled or position pnl is positive for " + pair));
+      }
     }
 }
 
@@ -1191,11 +1211,11 @@ async function setLeverage(pair, leverage) {
 
     try{
         if (process.env.MARGIN == "ISOLATED"){
-            const setUserLeverage = await linearClient.setUserLeverage({symbol: pair,buy_leverage: leverage,sell_leverage: leverage});
-            const setMarginSwitch = await linearClient.setMarginSwitch({symbol: pair,buy_leverage: leverage,sell_leverage: leverage,is_isolated: true});
+            const setUserLeverage = await linearClient.setLeverage({symbol: pair,buyLeverage: leverage,sellLeverage: leverage});
+            //const setMarginSwitch = await linearClient.setMarginSwitch({symbol: pair,buyLeverage: leverage,sellLeverage: leverage,is_isolated: true});
         } else {
-            const setUserLeverage = await linearClient.setUserLeverage({symbol: pair,buy_leverage: leverage,sell_leverage: leverage});
-            const setMarginSwitch = await linearClient.setMarginSwitch({symbol: pair,buy_leverage: leverage,sell_leverage: leverage,is_isolated: false});
+            const setUserLeverage = await linearClient.setLeverage({symbol: pair,buyLeverage: leverage,sellLeverage: leverage});
+            //const setMarginSwitch = await linearClient.setMarginSwitch({symbol: pair,buyLeverage: leverage,sellLeverage: leverage,is_isolated: false});
         }
     }
     catch (e) {
@@ -1207,40 +1227,40 @@ async function setLeverage(pair, leverage) {
 //set position mode to hedge
 async function setPositionMode() {
 
-    const set = await linearClient.setPositionMode({
+    const set = await linearClient.switchPositionMode({
         coin: "USDT",
-        mode: "BothSide"
+        mode: 3 //  0: Merged Single. 3: Both Sides
     });
     //log responses
-    if (set.ret_msg === "OK") {
+    if (set.retMsg === "OK") {
         logIT("Position mode set");
         return true;
     }
-    else if (set.ret_msg === "Partial symbols switched successfully, excluding symbols with open orders or positions.") {
+    else if (set.retMsg === "Partial symbols switched successfully, excluding symbols with open orders or positions.") {
         logIT("Position mode set for symbols without positions");
         return false;
     }
-    else if (set.ret_msg === "All symbols switched successfully."){
+    else if (set.retMsg === "All symbols switched successfully."){
         logIT("Position mode set");
-        return false;
+        return true;
     } else {
         logIT(chalk.redBright("Unable to set position mode"));
         return false;
     }
-    
+
 }
 
 async function checkLeverage(symbol) {
-    var position = await cachedLinearClient.getPosition({symbol: symbol});
+    var position = await linearClient.getPositionInfo({symbol: symbol}, true);
     var leverage = position.result[0].leverage;
     return leverage;
 }
 //create loop that checks for open positions every second
 async function checkOpenPositions() {
     //go through all pairs and getPosition()
-    var positions = await cachedLinearClient.getPosition();
-    openPositions = positions.result.filter(el => el.data.size > 0).length;
-    const data = await cachedLinearClient.getWalletBalance();
+    var positions = await linearClient.getPositionInfo({settleCoin: 'USDT'}, true);
+    openPositions = positions.result.list.length;  // positions.result.list.filter(el => parseFloat(el.size) > 0).length;
+    const data = await linearClient.getWalletBalance({accountType: process.env.ACCOUNT_TYPE, coin: 'USDT'}, true);
 
     // pairs in paused list are not handled
     // in this way user could set custom tp/sl and wait the trade to be completed
@@ -1249,40 +1269,43 @@ async function checkOpenPositions() {
     //logIT("Positions: " + JSON.stringify(positions, null, 2));
     var totalPositions = 0;
     var postionList = [];
-    if (positions.result !== null) {
-        for (var i = 0; i < positions.result.length; i++) {
-            if (positions.result[i].data.size > 0) {
-                //logIT("Open Position for " + positions.result[i].data.symbol + " with size " + positions.result[i].data.size + " and side " + positions.result[i].data.side + " and pnl " + positions.result[i].data.unrealised_pnl);
-                if (process.env.USE_RECALC_SL_TP == "true" && !pausedList.includes(positions.result[i].data.symbol))
-                    takeProfit(positions.result[i].data.symbol, positions.result[i].data);
-   
-                //get usd value of position
-                var usdValue = (positions.result[i].data.entry_price * positions.result[i].data.size) / process.env.LEVERAGE;
-                totalPositions++;
+    if (positions.result !== null) { // TOFO: remove
+        for (var i = 0; i < positions.result.list.length; i++) {
+            //if (parseFloat(positions.result.list[i].size) > 0) {
+            let position = positions.result.list[i]
+            //logIT("Open Position for " + positions.result[i].data.symbol + " with size " + positions.result[i].data.size + " and side " + positions.result[i].data.side + " and pnl " + positions.result[i].data.unrealised_pnl);
+            if (process.env.USE_RECALC_SL_TP == "true" && !pausedList.includes(position.symbol))
+                await takeProfit(position.symbol, position);
 
-                var profit = positions.result[i].data.unrealised_pnl;
-                //get available Balance
-                var availableBalance = data.available_balance;
-                //calculate the profit % change in USD
-                var margin = positions.result[i].data.position_value/process.env.LEVERAGE;
+            //get usd value of position
+            var usdValue = (parseFloat(position.avgPrice) * parseFloat(position.size)) / process.env.LEVERAGE;
+            totalPositions++;
 
-                if (positions.result[i].data.is_isolated == false)
-                    margin = positions.result[i].data.position_margin - global_balance;
+            var profit = parseFloat(position.unrealisedPnl);
+            //get available Balance
+            var availableBalance = data.availableBalance;
+            //calculate the profit % change in USD
+            // var margin = parseFloat(position.positionValue)/process.env.LEVERAGE;
 
-                var percentGain = (profit / margin) * 100;
+            // if (positions.result[i].data.is_isolated == false)
+            //     margin = positions.result[i].data.position_margin - global_balance;
+            // TODO: check margin
+            const margin = parseFloat(position.positionMM)
 
-                //create object to store in postionList
-                var position = {
-                    symbol: positions.result[i].data.symbol,
-                    size: positions.result[i].data.size,
-                    usdValue: usdValue.toFixed(4),
-                    side: positions.result[i].data.side,
-					dca_count: positions.result[i].dca_count, // for future use
-                    pnl: positions.result[i].data.unrealised_pnl.toFixed(5) + "(" + percentGain.toFixed(2) + ")"
-                }
-                postionList.push(position);
-                
+            var percentGain = (profit / margin) * 100;
+
+            //create object to store in postionList
+            var positionElement = {
+                symbol: position.symbol,
+                size: parseFloat(position.size),
+                usdValue: usdValue.toFixed(4),
+                side: position.side,
+                //dca_count: positions.result[i].dca_count, // for future use
+                pnl: parseFloat(position.unrealisedPnl).toFixed(5) + "(" + percentGain.toFixed(2) + ")"
             }
+            postionList.push(positionElement);
+
+            //}
         }
     }
     else {
@@ -1311,7 +1334,7 @@ async function closeOrphanOrders(openPositionsList, openOrders) {
   if(orphans.length > 0) {
     orphans.forEach(async el => {
       let res =  await cancelOrder(linearClient, el.symbol);
-      if (res.ret_msg != "OK")
+      if (res.retMsg != "OK")
         logIT(`closeQuitPosition - error cancelling orphan orders for ${el.symbol}`, LOG_LEVEL.ERROR);
       else
         logIT(`closeQuitPosition - successfully cancel orphan orders for ${el.symbol}`);
@@ -1322,31 +1345,33 @@ async function closeOrphanOrders(openPositionsList, openOrders) {
 }
 
 async function getMinTradingSize() {
-    const url = "https://api.bybit.com/v2/public/symbols";
-    const response = await fetch(url);
-    const data = await response.json();
-    var balance = (await cachedLinearClient.getWalletBalance()).whole_balance;
+    const response = await linearClient.getInstrumentsInfo();
+    if (response.retCode != 0)
+      throw Error(response.retMsg);
+    const allData = response.result.list;
+    const data = allData.filter(el => el.contractType == 'LinearPerpetual' && el.quoteCoin == 'USDT');
+    var balance = (await linearClient.getWalletBalance({accountType: process.env.ACCOUNT_TYPE, coin: 'USDT'}, true)).wholeBalance;
 
     if (balance !== null) {
-        var tickers = await cachedLinearClient.getTickers();
-        var positions = await cachedLinearClient.getPosition();
+        var tickers = await linearClient.getTickers({}, true);
+        //var positions = await linearClient.getPositionInfo({settleCoin: 'USDT'}, true);
 
         minOrderSizes = []; //update global variable TODO: refactoring to avoid global
         logIT("Fetching min Trading Sizes for pairs, this could take a minute...");
-        for (var i = 0; i < data.result.length; i++) {
-            logIT("Pair: " + data.result[i].name + " Min Trading Size: " + data.result[i].lot_size_filter.min_trading_qty);
+        for (var i = 0; i < data.length; i++) {
+            logIT("Pair: " + data[i].symbol + " Min Trading Size: " + data[i].lotSizeFilter.minOrderQty);
             //check if min_trading_qty usd value is less than process.env.MIN_ORDER_SIZE
-            var minOrderSize = data.result[i].lot_size_filter.min_trading_qty;
+            var minOrderSize = data[i].lotSizeFilter.minOrderQty;
             //get price of pair from tickers
-            var priceFetch = tickers.result.find(x => x.symbol === data.result[i].name);
+            var priceFetch = tickers.result.list.find(x => x.symbol === data[i].symbol);
             if (!priceFetch) {
-              console.log("Ignore Pair: " + data.result[i].name + " as ticker was not found");
+              console.log("Ignore Pair: " + data[i].symbol + " as ticker was not found");
               continue;
             }
-            var price = priceFetch.last_price;
+            var price = parseFloat(priceFetch.lastPrice);
             //get usd value of min order size
             var usdValue = (minOrderSize * price);
-            //logIT("USD value of " + data.result[i].name + " is " + usdValue);
+            //logIT("USD value of " + data[i].symbol + " is " + usdValue);
             //find usd valie of process.env.MIN_ORDER_SIZE
             var minOrderSizeUSD = (balance * process.env.PERCENT_ORDER_SIZE/100) * process.env.LEVERAGE;
             //logIT("USD value of " + process.env.PERCENT_ORDER_SIZE + " is " + minOrderSizeUSD);
@@ -1363,20 +1388,20 @@ async function getMinTradingSize() {
             }
             try{
                 //find pair ion positions
-                var position = positions.result.find(x => x.data.symbol === data.result[i].name);
-                if (position === undefined) {
-                  logIT(chalk.bgRed(`skip ${data.result[i].name} position is undefined`));
-                  continue;
-                }
+                // var position = positions.result.list.find(x => x.symbol === data[i].symbol);
+                // if (position === undefined) {
+                //   logIT(chalk.bgRed(`skip ${data[i].symbol} position is undefined`));
+                //   continue;
+                // }
 
                 //find max position size for pair
                 var maxPositionSize = ((balance * (process.env.MAX_POSITION_SIZE_PERCENT/100)) / price) * process.env.LEVERAGE;
                 //save min order size and max position size to json
                 var minOrderSizeJson = {
-                    "pair": data.result[i].name,
+                    "pair": data[i].symbol,
                     "minOrderSize": minOrderSizePair,
                     "maxPositionSize": maxPositionSize,
-                    "tickSize": data.result[i].price_filter.tick_size,
+                    "tickSize": data[i].priceFilter.tickSize,
                     "tradeable": tradeable
                 }
 
@@ -1422,20 +1447,20 @@ async function getMinTradingSize() {
 //get all symbols
 async function getSymbols() {
     try{
-        const url = "https://api.bybit.com/v2/public/symbols";
-        const response = await fetch(url);
-        const data = await response.json();
-        //console.log(JSON.stringify(data.result[0], null, 2));
+        const response = await linearClient.getTickers();
+        if (response.retCode != 0)
+          throw Error(response.retMsg);
         var symbols = [];
+        const data = response.result.list;
         //only allow symbols that are not inverse
-        for (var i = 0; i < data.result.length; i++) {
+        for (var i = 0; i < data.length; i++) {
             //check if 1000 or any number is in the name
-            if (data.result[i].name.includes("1000")) {
+            if (data[i].symbol.includes("1000")) {
                 continue;
             }
             else {
                 var t1 = "liquidation.";
-                var t2 = data.result[i].name.toString();
+                var t2 = data[i].symbol.toString();
                 //check if t2 ends in USDT
                 if (t2.endsWith("USDT")) {
                     var pair = t1.concat(t2);
@@ -1447,8 +1472,8 @@ async function getSymbols() {
         }
         return symbols;
     }
-    catch{
-        logIT("Error fetching symbols");
+    catch(err) {
+        logIT(err);
         return null;
     }
 }
@@ -1486,14 +1511,14 @@ async function createSettings() {
 					var riskLevelshort = process.env.RISK_LEVEL_SHORT;
 					if (riskLevellong !== '0') {
 						var long_risk = out.data[i].long_price * (1 + riskLevellong / 100);
-					} 
+					}
 					else {
 					var long_risk = out.data[i].long_price;
 					}
 
 					if (riskLevelshort !== '0') {
 						var short_risk = out.data[i].short_price * (1 - riskLevelshort / 100);
-					} 
+					}
 					else {
 					var short_risk = out.data[i].short_price;
 					}
@@ -1564,13 +1589,13 @@ async function updateSettings() {
 						var riskLevelshort = process.env.RISK_LEVEL_SHORT;
 						if (riskLevellong !== '0') {
 							var long_risk = out.data[i].long_price * (1 + riskLevellong / 100);
-						} 
+						}
 						else {
 						var long_risk = out.data[i].long_price;
 						}
 						if (riskLevelshort !== '0') {
 							var short_risk = out.data[i].short_price * (1 - riskLevelshort / 100);
-						} 
+						}
 						else {
 						var short_risk = out.data[i].short_price;
                         }
@@ -1603,13 +1628,13 @@ async function updateSettings() {
 								var riskLevelshort = process.env.RISK_LEVEL_SHORT;
 								if (riskLevellong !== '0') {
 									var long_risk = researchFile.data[i].long_price * (1 + riskLevellong / 100);
-								} 
+								}
 								else {
 									var long_risk = researchFile.data[i].long_price;
 								}
 								if (riskLevelshort !== '0') {
 									var short_risk = researchFile.data[i].short_price * (1 - riskLevelshort / 100);
-								} 
+								}
 								else {
 								var short_risk = researchFile.data[i].short_price;
 								}
@@ -1752,7 +1777,7 @@ async function reportWebhook() {
     if(process.env.USE_DISCORD == "true") {
         const settings = JSON.parse(fs.readFileSync('account.json', 'utf8'));
         //fetch balance first if not startingBalance will be null
-        var balance = (await cachedLinearClient.getWalletBalance()).whole_balance;
+        var balance = (await linearClient.getWalletBalance({accountType: process.env.ACCOUNT_TYPE, coin: 'USDT'}, true)).wholeBalance;
         //check if starting balance is set
         if (settings.startingBalance === 0) {
             settings.startingBalance = balance;
@@ -1775,14 +1800,14 @@ async function reportWebhook() {
         var diff = diff.toFixed(6);
         var balance = balance.toFixed(2);
         //fetch positions
-        var positions = await cachedLinearClient.getPosition();
+        var positions = await linearClient.getPositionInfo({settleCoin: 'USDT'}, true);
         var positionList = [];
         var marg = await getMargin();
         var time = await getServerTime();
         //loop through positions.result[i].data get open symbols with size > 0 calculate pnl and to array
         for (var i = 0; i < positions.result.length; i++) {
             if (positions.result[i].data.size > 0) {
-                
+
                 var pnl1 = positions.result[i].data.unrealised_pnl;
                 var pnl = pnl1.toFixed(6);
                 var symbol = positions.result[i].data.symbol;
@@ -1791,8 +1816,8 @@ async function reportWebhook() {
                 var size = size.toFixed(4);
                 var ios = positions.result[i].data.is_isolated;
 
-                var priceFetch = await cachedLinearClient.getTickers({symbol: symbol});
-                var test = priceFetch.result[0].last_price;
+                var priceFetch = await linearClient.getTickers({symbol: symbol}, true);
+                var test = priceFetch.result[0].lastPrice;
 
                 let side = positions.result[i].data.side;
                 var dir = "";
@@ -1950,7 +1975,7 @@ async function main() {
 
         if (process.env.USE_DISCORD == "true")
             messageWebhook(err);
-            
+
         await sleep(10000);
     }
 
@@ -1970,12 +1995,12 @@ async function main() {
     // start main loop when the initialization is completed
     while (initDone) {
         try {
-            cachedLinearClient.invalidate();
+            linearClient.invalidateCache();
             await checkOpenPositions();
             await getBalance();
             await updateSettings();
 
-            await sleep(cachedLinearClient.getRateLimit());
+            await sleep(linearClient.getRateLimit());
         } catch (e) {
             console.log(e);
             sleep(1000);
@@ -2032,7 +2057,7 @@ async function checkForUpdates() {
         'User-Agent': 'Node.js'
       }
     };
-  
+
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => {
@@ -2047,11 +2072,11 @@ async function checkForUpdates() {
         }
       });
     });
-  
+
     req.on('error', (error) => {
       logIT(error);
     });
-  
+
     req.end();
   }
 
