@@ -1,24 +1,28 @@
+//  Copyright (C)2022 - Alessandro Arrabito - <arrabitoster@gmail.com> - Strambatax on TradingView
+
 import { env } from 'process';
 
 export async function createMarketOrder(linearClient, pair, side, size, take_profit = 0, stop_loss = 0) {
 
   var cfg = {
+    category: "linear",
     side: side,
-    order_type: "Market",
+    orderType: "Market",
     symbol: pair,
     qty: size,
-    time_in_force: "GoodTillCancel",
-    reduce_only: false,
-    close_on_trigger: false
+    timeInForce: "GTC",
+    reduceOnly: false,
+    closeOnTrigger: false,
+    positionIdx: process.env.POSITION_MODE == "HEDGE" ? (side == "Buy" ? 1 : 2) : 0
   };
 
   if (take_profit != 0)
-    cfg['take_profit'] = take_profit;
+    cfg['takeProfit'] = take_profit;
   if (stop_loss != 0)
-    cfg['stop_loss'] = stop_loss;
+    cfg['stopLoss'] = stop_loss;
 
   // send order payload
-  const order = await linearClient.placeActiveOrder(cfg);
+  const order = await linearClient.submitOrder(cfg);
   return order;
 }
 
@@ -26,21 +30,23 @@ export async function createLimitOrder(linearClient, pair, side, size, price, pa
 
   var cfg = {
     side: side,
-    order_type: "Limit",
+    orderType: "Limit",
     symbol: pair,
     qty: size,
-    time_in_force: "GoodTillCancel",
-    reduce_only: false,
-    close_on_trigger: false,
+    timeInForce: "GTC",
+    reduceOnly: false,
+    closeOnTrigger: false,
     price: price,
+    // if hedge mode
+    positionIdx: process.env.POSITION_MODE == "HEDGE" ? (side == "Buy" ? 1 : 2) : 0,
     ...params
   };
 
   // send order payload
-  const order = await linearClient.placeActiveOrder(cfg);
+  const order = await linearClient.submitOrder(cfg);
   return order;
 }
 
 export async function cancelOrder(linearClient, pair) {
-  return await linearClient.cancelAllActiveOrders({'symbol': pair});
+  return await linearClient.cancelAllOrders({'symbol': pair});
 }
