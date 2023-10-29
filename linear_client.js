@@ -3,6 +3,9 @@
 //  ByBit linear client decorator
 
 import { RestClientV5 } from 'bybit-api';
+import { exit } from 'process';
+import { logIT, LOG_LEVEL } from './log.js';
+import { truncate } from 'fs';
 
 const baseRateLimit = 2000;
 
@@ -17,6 +20,7 @@ export class LinearClient {
       testnet: params.testnet,
     });
 
+    this.rateLimitExceedCallback = params.rateLimitExceedCallback;
     this.requestsCache = new Map();
     this.rateLimit = baseRateLimit;
   }
@@ -26,32 +30,40 @@ export class LinearClient {
   }
 
   updateRateLimit(resp) {
-    if (resp.retCode != 0) {
-      return false;
+
+    if (resp.retMsg == "Too many visits!") {
+      this.rateLimitExceedCallback();
     }
 
     //check rateLimitStatus
-    if (resp.rateLimitStatus) {
-      //check rateLimitStatus
-      if (resp.rateLimitStatus > 100) {
-        this.rateLimit = baseRateLimit;
-        logIT("Rate limit status: " + chalk.green(resp.rateLimitStatus));
-      }
-      else if (resp.rateLimitStatus > 75) {
-        this.rateLimit += 500;
-        logIT("Rate limit status: " + chalk.greenBright(resp.rateLimitStatus));
-      }
-      else if (resp.rateLimitStatus > 50) {
-        this.rateLimit +=  1000;
-        logIT("Rate limit status: " + chalk.yellowBright(resp.rateLimitStatus));
-      }
-      else if (resp.rateLimitStatus > 25) {
-        this.rateLimit +=  2000;
-        logIT("Rate limit status: " + chalk.yellow(resp.rateLimitStatus));
-      }
-      else {
-        this.rateLimit +=  4000;
-        logIT("Rate limit status: " + chalk.red(resp.rateLimitStatus));
+    if (resp.headers && Object.keys(resp.headers).find(el => el == "x-bapi-limit")) {
+      const rateLimit = resp.headers["x-bapi-limit"];
+      const rateLimitStatus = resp.headers["x-bapi-limit-status"];
+      logIT(`Rate limit ${rateLimit} status: ${rateLimitStatus}`);
+      const rateLimitPrc = (rateLimitStatus/rateLimit).toFixed(1);
+      switch(rateLimitPrc) {
+        case "1.0":
+        case "0.9":
+        case "0.8":
+        case "0.7":
+          this.rateLimit = baseRateLimit;
+          break;
+        case "0.6":
+        case "0.5":
+          this.rateLimit += 500;
+          break;
+        case "0.4":
+          this.rateLimit +=  1000;
+          break;
+        case "0.3":
+        case "0.2":
+          this.rateLimit +=  2000;
+          break;
+        case "0.1":
+        case "0.0":
+          this.rateLimit +=  4000;
+          logIT("Rate limit status: " + chalk.red(resp.rateLimitStatus));
+          break;
       }
     }
     return true;
@@ -102,10 +114,6 @@ export class LinearClient {
     return await this.linearClient.setMarginSwitch({category: 'linear', ...params});
   }
 
-  async switchPositionMode(params) {
-    return await this.linearClient.switchPositionMode({category: 'linear', ...params});
-  }
-
   async getInstrumentsInfo(params = {}, getCachedValue = false) {
     return await this.runAndCache(this.linearClient.getInstrumentsInfo, params, "getInstrumentsInfo", getCachedValue);
   }
@@ -138,4 +146,13 @@ export class LinearClient {
   async getHistoricOrders(params = {}, getCachedValue = false) {
     return await this.runAndCache(this.linearClient.getHistoricOrders, params, "getHistoricOrders", getCachedValue);
   }
+
+  async submitOrder(params) {
+    return await this.linearClient.submitOrder({category: 'linear', ...params});
+  }
+
+  async cancelAllOrders(params) {
+    return await this.linearClient.cancelAllOrders({category: 'linear', ...params});
+  }
+
 }
